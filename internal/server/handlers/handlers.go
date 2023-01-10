@@ -1,27 +1,51 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/rasha108bik/tiny_url/config"
 	"github.com/rasha108bik/tiny_url/internal/storage"
+	"github.com/rasha108bik/tiny_url/internal/storage/postgres"
 )
 
 type Handlers interface {
+	CreateShorten(w http.ResponseWriter, r *http.Request)
 	CreateShortLink(w http.ResponseWriter, r *http.Request)
 	GetOriginalURL(w http.ResponseWriter, r *http.Request)
+	FetchURLs(w http.ResponseWriter, r *http.Request)
 	ErrorHandler(w http.ResponseWriter, r *http.Request)
+	Ping(w http.ResponseWriter, r *http.Request)
 }
 
 type handler struct {
-	storage storage.Storage
+	cfg         *config.Config
+	memDB       storage.Storager
+	fileStorage storage.Storager
+	pg          postgres.Postgres
+	pgcon       bool
 }
 
-func NewHandler(storage storage.Storage) *handler {
+func NewHandler(
+	cfg *config.Config,
+	memDB storage.Storager,
+	fileStorage storage.Storager,
+	pg postgres.Postgres,
+	pgcon bool,
+) *handler {
 	return &handler{
-		storage: storage,
+		cfg:         cfg,
+		memDB:       memDB,
+		fileStorage: fileStorage,
+		pg:          pg,
+		pgcon:       pgcon,
 	}
 }
 
@@ -37,15 +61,36 @@ func (h *handler) CreateShortLink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	res, err := h.storage.StoreURL(string(resBody))
+	originalURL := string(resBody)
+	shortURL, err := storage.GenerateUniqKey()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	log.Printf("h.pgcon: %#v\n", h.pgcon)
+	if h.pgcon {
+		err = h.pg.StoreURL(originalURL, shortURL)
+		if err != nil {
+			log.Printf("pg.StoreURL: %v\n", err)
+		}
+	}
+
+	err = h.memDB.StoreURL(originalURL, shortURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = h.fileStorage.StoreURL(originalURL, shortURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_, err = w.Write([]byte("http://127.0.0.1:8080/" + res))
+	_, err = w.Write([]byte(h.cfg.BaseURL + "/" + shortURL))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -53,17 +98,127 @@ func (h *handler) CreateShortLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) GetOriginalURL(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if id == "" {
+	shortURL := chi.URLParam(r, "id")
+	if shortURL == "" {
 		http.Error(w, "id emtpy", http.StatusBadRequest)
 		return
 	}
 
-	url, err := h.storage.GetURLShortID(id)
+	if h.pgcon {
+		originalURL, err := h.pg.GetOriginalURLByShortURL(shortURL)
+		if err != nil {
+			log.Printf("pg.GetOriginalURLByShortURL: %v\n", originalURL)
+		}
+	}
+
+	originalURL, err := h.memDB.GetURLShortID(shortURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
+}
+
+func (h *handler) CreateShorten(w http.ResponseWriter, r *http.Request) {
+	m := ReqCreateShorten{}
+	err := json.NewDecoder(r.Body).Decode(&m)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	shortURL, err := storage.GenerateUniqKey()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if h.pgcon {
+		err = h.pg.StoreURL(m.URL, shortURL)
+		if err != nil {
+			log.Printf("pg.StoreURL: %v\n", err)
+		}
+	}
+
+	err = h.memDB.StoreURL(m.URL, shortURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = h.fileStorage.StoreURL(m.URL, shortURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respRCS := RespReqCreateShorten{Result: h.cfg.BaseURL + "/" + shortURL}
+	response, err := json.Marshal(respRCS)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_, err = w.Write(response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (h *handler) FetchURLs(w http.ResponseWriter, r *http.Request) {
+	// if h.pgcon {
+	// 	mapURLs, err := h.pg.GetAllURLs()
+	// 	if err != nil {
+	// 		log.Printf("pg.mapURLs: %v\n and data urls: %v\n", err, mapURLs)
+	// 	}
+	// }
+
+	mapURLs := h.memDB.GetURLsShort()
+	if len(mapURLs) == 0 {
+		http.Error(w, errors.New("urls is empty").Error(), http.StatusNoContent)
+		return
+	}
+
+	mapData := mapperGetOriginalURLs(mapURLs, h.cfg.BaseURL)
+	res, err := json.Marshal(mapData)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(res)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func mapperGetOriginalURLs(data map[string]string, baseURL string) []RespGetOriginalURLs {
+	res := make([]RespGetOriginalURLs, 0)
+	for k, v := range data {
+		res = append(res, RespGetOriginalURLs{
+			ShortURL:    baseURL + "/" + k,
+			OriginalURL: v,
+		})
+	}
+	return res
+}
+
+func (h *handler) Ping(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	err := h.pg.Ping(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
